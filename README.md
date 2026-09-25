@@ -37,10 +37,14 @@ It combines three tools:
 
 ## Install
 
-### Arch Linux (AUR)
+### Arch Linux (package)
+
+The package isn't on the AUR yet (AUR registrations are paused). Until it is,
+build it from the PKGBUILD in this repo:
 
 ```sh
-yay -S attach        # or paru -S attach, or any AUR helper
+git clone https://github.com/jaderfeijo/attach.git
+cd attach/packaging/aur && makepkg -si
 ```
 
 The package installs `attach` to `/usr/bin` and pulls in reptyr, abduco and
