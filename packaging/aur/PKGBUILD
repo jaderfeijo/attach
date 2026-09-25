@@ -1,0 +1,23 @@
+# Maintainer: Jader Feijo <3536255+jaderfeijo@users.noreply.github.com>
+pkgname=attach
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Steal a running terminal into the current one and keep it in a named, detachable session (reptyr + abduco + fzf)'
+arch=('any')
+url='https://github.com/jaderfeijo/attach'
+license=('MIT')
+depends=('bash' 'reptyr' 'abduco' 'fzf' 'procps-ng' 'coreutils' 'gawk' 'grep' 'libcap')
+install=attach.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('1eac3c4a4a6e0bd1466746aef8e9de64380d70d51229def9133634de3ea2257a')
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 attach "$pkgdir/usr/bin/attach"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/how-it-works.md "$pkgdir/usr/share/doc/$pkgname/how-it-works.md"
+  # opt-in ptrace setups, never activated by the package (see attach.install)
+  install -Dm644 contrib/60-attach-ptrace.conf "$pkgdir/usr/share/$pkgname/60-attach-ptrace.conf"
+  install -Dm644 contrib/attach-reptyr-ptrace.hook "$pkgdir/usr/share/$pkgname/attach-reptyr-ptrace.hook"
+}

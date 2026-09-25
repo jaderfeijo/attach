@@ -1,0 +1,23 @@
+# attach needs reptyr to be able to ptrace your programs; point at the two
+# opt-in ways to allow it, unless one is already in place
+post_install() {
+  local scope
+  scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)
+  [ "$scope" = 0 ] && return 0
+  getcap /usr/bin/reptyr 2>/dev/null | grep -q cap_sys_ptrace && return 0
+  cat <<'MSG'
+==> attach: reptyr can't ptrace your programs yet (yama ptrace_scope is not 0).
+    Pick one (trade-offs: /usr/share/doc/attach/README.md, "ptrace permission"):
+
+    recommended, lets your processes ptrace your other processes:
+      sudo cp /usr/share/attach/60-attach-ptrace.conf /etc/sysctl.d/ && sudo sysctl --system
+
+    or give reptyr the capability, and keep it across reptyr upgrades:
+      sudo setcap cap_sys_ptrace+ep /usr/bin/reptyr
+      sudo install -Dm644 /usr/share/attach/attach-reptyr-ptrace.hook /etc/pacman.d/hooks/attach-reptyr-ptrace.hook
+MSG
+}
+
+post_upgrade() {
+  post_install
+}

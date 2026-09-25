@@ -1,0 +1,21 @@
+pkgbase = attach
+	pkgdesc = Steal a running terminal into the current one and keep it in a named, detachable session (reptyr + abduco + fzf)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/jaderfeijo/attach
+	install = attach.install
+	arch = any
+	license = MIT
+	depends = bash
+	depends = reptyr
+	depends = abduco
+	depends = fzf
+	depends = procps-ng
+	depends = coreutils
+	depends = gawk
+	depends = grep
+	depends = libcap
+	source = attach-0.1.0.tar.gz::https://github.com/jaderfeijo/attach/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 1eac3c4a4a6e0bd1466746aef8e9de64380d70d51229def9133634de3ea2257a
+
+pkgname = attach
