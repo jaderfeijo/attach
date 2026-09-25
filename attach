@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# attach — fuzzy-pick a running terminal session on this machine and steal it
+# into the current terminal (e.g. over SSH) using reptyr.
+#
+#   attach               list TTY sessions, steal the whole terminal (reptyr -T)
+#   attach -p            list individual processes, steal just that process (reptyr)
+#   attach -l            print the table and exit
+#
+#   attach -s NAME       name the session (default: process name + number,
+#                        e.g. vim0, vim1, ...)
+#   attach --no-session  steal straight into this terminal, no abduco wrapper
+#   attach -k            keep the original window open (frozen) after a steal
+#
+#   attach -r NAME       join session NAME directly, skipping the picker
+#   attach -K NAME       kill session NAME (Ctrl-X on a '*' row does the same)
+#   attach -L            list sessions (abduco's view)
+#   attach -V            print the version
+#
+# Each steal runs in its own named abduco session, one process per session, so
+# it outlives the SSH connection: detach with Ctrl-D and the program keeps
+# running. Captured programs show up in the lists marked '*', whether detached
+# or attached in another window; picking one joins its session (several windows
+# can be attached at once) instead of stealing it again, so nothing nests.
+# Ctrl-D is taken by the session, so it never reaches the program as EOF: leave
+# a shell with `exit`. Already inside tmux or another attach session? A steal
+# goes into the current terminal rather than nesting.
+#
+# Note: this MOVES the session. Once a whole terminal is stolen, its original
+# window is closed (SIGKILL to the emulator, e.g. Alacritty, so it can't hang up the
+# stolen process on the way out) unless that process also hosts other
+# terminals, or -k is given.
+
+set -euo pipefail
+
+ATTACH_VERSION=0.1.0
+
+die() { printf 'attach: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
+  exit 0
+}
+
+mode=terminal
+list_only=0
+use_session=1
+no_session_explicit=0
+session=""
+keep_window=0
+rows_only=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--process)     mode=process ;;
+    -l|--list)        list_only=1 ;;
+    -T|--no-session)  use_session=0; no_session_explicit=1 ;;
+    -k|--keep-window) keep_window=1 ;;
+    -s|--session)     [ $# -ge 2 ] || die "$1 needs a session name"; session=$2; shift ;;
+    -s*)              session=${1#-s} ;;
+    --session=*)      session=${1#--session=} ;;
+    -r|--resume)      [ $# -ge 2 ] || die "$1 needs a session name"; mode=resume; session=$2; shift ;;
+    -r*)              mode=resume; session=${1#-r} ;;
+    --resume=*)       mode=resume; session=${1#--resume=} ;;
+    -L|--sessions)    mode=sessions ;;
+    -K|--kill)        [ $# -ge 2 ] || die "$1 needs a session name"; mode=kill; session=$2; shift ;;
+    --rows)           rows_only=1 ;;                 # internal: fzf reload
+    -h|--help)        usage ;;
+    -V|--version)     echo "attach $ATTACH_VERSION"; exit 0 ;;
+    *)                die "unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+DETACH_KEY='^d'
+
+need_abduco() {
+  command -v abduco >/dev/null 2>&1 || die "abduco not found; install it with your package manager${1:+, $1}"
+}
+
+# names of this user's abduco sessions; the name is the last tab-separated field
+# of each line after the "Active sessions" header
+session_names() {
+  command -v abduco >/dev/null 2>&1 || return 0
+  { abduco 2>/dev/null || true; } | awk -F'\t' 'NR > 1 {print $NF}'
+}
+session_exists() { session_names | grep -qxF -- "$1"; }
+
+# force a full repaint of the program in a session: many full-screen apps draw only
+# what changed and repaint everything only on a real size change, which a fresh
+# steal or a reattach at the same size never produces. So shrink the program's
+# pty by a row and put it back.
+repaint_later() {  # pid delay
+  local dev r c
+  sleep "$2"
+  dev=/dev/$(ps -o tty= -p "$1" | tr -d ' ')
+  [ -c "$dev" ] || return 0
+  read -r r c < <(stty -F "$dev" size) || return 0
+  [ "$r" -gt 1 ] || return 0
+  stty -F "$dev" rows $((r - 1)); sleep 0.3; stty -F "$dev" rows "$r"
+}
+export -f repaint_later
+
+# session name -> pid of the program stolen into it: reptyr's last argument,
+# reptyr running under the bash that the session's abduco server started
+session_target() {
+  local rp p cmd
+  for rp in $(pgrep -u "$USER" -x reptyr); do
+    p=$(ps -o ppid= -p "$(ps -o ppid= -p "$rp" | tr -d ' ')" | tr -d ' ') || continue
+    cmd=$(tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null) || continue
+    if grep -qx -- -c <<<"$cmd" && grep -qxF -- "$1" <<<"$cmd"; then
+      tr '\0' '\n' <"/proc/$rp/cmdline" | tail -n 1
+      return 0
+    fi
+  done
+}
+
+# the session this terminal is inside, if any. ATTACH_SESSION is only set in a
+# session's wrapper, a stolen program keeps its old environment, so also match
+# this tty against each session's stolen terminal
+current_session() {
+  local me sn t
+  [ -n "${ATTACH_SESSION:-}" ] && { printf '%s' "$ATTACH_SESSION"; return 0; }
+  me=$(ps -o tty= -p $$ | tr -d ' ')
+  case "$me" in pts/*) ;; *) return 0 ;; esac
+  for sn in $(session_names); do
+    t=$(session_target "$sn" || true)
+    if [ -n "$t" ] && [ "$(ps -o tty= -p "$t" | tr -d ' ')" = "$me" ]; then
+      printf '%s' "$sn"; return 0
+    fi
+  done
+}
+
+# end a session the way closing its terminal would: hang up the stolen
+# program's whole process session (SIGHUP, then TERM, then KILL for whatever
+# ignores it); the abduco session closes once reptyr sees it go. Only a process
+# leading its own session gets the session-wide signal, so a -p steal can
+# never hit the shell it was taken from.
+kill_session() {
+  local target sid sig i p
+  session_exists "$1" || die "no session named '$1'"
+  target=$(session_target "$1" || true)
+  if [ -n "$target" ]; then
+    sid=$(ps -o sid= -p "$target" | tr -d ' ' || true)
+    for sig in HUP TERM KILL; do
+      if [ "$sid" = "$target" ]; then pkill -"$sig" -s "$sid" || true
+      else kill -"$sig" "$target" 2>/dev/null || true; fi
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -d "/proc/$target" ] || break 2
+        sleep 0.2
+      done
+    done
+  fi
+  # the server itself, should it outlive its program (e.g. reptyr had failed)
+  for i in 1 2 3 4 5 6 7 8 9 10; do session_exists "$1" || return 0; sleep 0.2; done
+  for p in $(pgrep -u "$USER" -x abduco); do
+    [ "$(ps -o tty= -p "$p" | tr -d ' ')" = '?' ] || continue    # clients have a tty
+    tr '\0' '\n' <"/proc/$p/cmdline" | grep -qxF -- "$1" && kill "$p" 2>/dev/null
+  done
+  return 0
+}
+
+if [ "$mode" = kill ]; then
+  [ -n "$session" ] || exit 0         # Ctrl-X on a row that isn't a session
+  kill_session "$session"
+  exit 0
+fi
+
+# --------------------------------------------------------------- sessions --
+if [ "$mode" = sessions ]; then
+  need_abduco
+  out=$(abduco 2>/dev/null | tail -n +2)
+  [ -n "$out" ] || { echo "attach: no sessions"; exit 0; }
+  # leading '*' = someone attached, '+' = process exited
+  printf '%s\n' "$out"
+  exit 0
+fi
+
+# join a session, alongside any window already attached to it
+resume() {
+  local target
+  need_abduco
+  session_exists "$1" || die "no session named '$1' (see attach -L)"
+  local cur
+  cur=$(current_session)
+  if [ -n "$cur" ]; then
+    [ "$cur" = "$1" ] && die "this terminal is session '$1' already"
+    die "inside session '$cur'; detach (Ctrl-D) before joining '$1'"
+  fi
+  target=$(session_target "$1" || true)
+  [ -n "$target" ] && repaint_later "$target" 0.5 </dev/null >/dev/null 2>&1 &
+  exec abduco -e "$DETACH_KEY" -a "$1"
+}
+
+[ "$mode" = resume ] && resume "$session"
+
+# ------------------------------------------------------------------ steal --
+command -v reptyr >/dev/null 2>&1 || die "reptyr not found; install it with your package manager"
+command -v fzf    >/dev/null 2>&1 || die "fzf not found; install it with your package manager"
+
+case "$session" in
+  */*|-*) die "session names cannot contain '/' or start with '-'" ;;
+esac
+[ -n "$session" ] && [ "$no_session_explicit" -eq 1 ] && die "-s/--session makes no sense with --no-session"
+
+# already in a detachable terminal: don't nest another session inside it
+if [ "$use_session" -eq 1 ]; then
+  cur=$(current_session)
+  if [ -n "$cur" ]; then
+    use_session=0; where="attach session '$cur'"
+  elif [ -n "${TMUX:-}" ]; then
+    use_session=0; where="tmux"
+  fi
+  if [ "$use_session" -eq 0 ] && [ -n "$session" ]; then
+    printf 'attach: already inside %s, stealing into this terminal (-s %s ignored)\n' "$where" "$session" >&2
+  fi
+fi
+
+if [ "$use_session" -eq 1 ] && [ "$list_only" -eq 0 ]; then
+  need_abduco "or use --no-session"
+fi
+
+
+self_tty=$(ps -o tty= -p $$ | tr -d ' ')
+
+# ptys already captured, so never offered again: a session's inner pty (its
+# master is held by abduco) and a stolen terminal (reptyr -T PID keeps PID on
+# its old pty; reptyr's own fdinfo is unreadable, it runs with file caps)
+captured_ttys() {
+  local p target
+  for p in $(pgrep -u "$USER" -x abduco); do
+    grep -hs '^tty-index:' "/proc/$p/fdinfo/"* | awk '{print "pts/" $2}' || true
+  done
+  for p in $(pgrep -u "$USER" -x reptyr); do
+    target=$(tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | tail -n 1) || continue
+    ps -o tty= -p "$target" 2>/dev/null | tr -d ' ' || true
+  done
+}
+declare -A captured
+while read -r t; do [ -n "$t" ] && captured[$t]=1; done < <(captured_ttys)
+
+# the process name only (no path, no arguments) — the full command line goes in
+# a hidden field that the fzf preview shows, wrapped
+proc_name() {
+  local n=""
+  { read -r n <"/proc/$1/comm"; } 2>/dev/null || { n=${2%% *}; n=${n##*/}; }
+  printf '%s' "${n:-?}"
+}
+
+pretty_path() { case "$1" in "$HOME") echo '~' ;; "$HOME"/*) echo "~${1#$HOME}" ;; *) echo "$1" ;; esac; }
+
+# ---------------------------------------------------------------- terminals --
+list_terminals() {
+  declare -A leader fg fgcmd age
+  while read -r pid sid tpgid pgid tty etime cmd; do
+    # only pty sessions: a real console (tty1) is the login/desktop session,
+    # and stealing that would take the graphical session down with it
+    case "$tty" in pts/*) ;; *) continue ;; esac
+    [ -n "${captured[$tty]:-}" ] && continue       # already stolen / inside a session
+    [ "$tty" = "$self_tty" ] && continue           # never offer our own terminal
+    [ "$pid" = "$sid" ] && { leader[$tty]=$pid; age[$tty]=$etime; }
+    if [ "$pgid" = "$tpgid" ]; then                # foreground process group
+      fg[$tty]=$pid
+      fgcmd[$tty]=$cmd
+    fi
+  done < <(ps -u "$USER" -o pid=,sid=,tpgid=,pgid=,tty=,etime=,args= --sort=start_time)
+
+  local tty pid cwd cmd dir name shown
+  for tty in "${!leader[@]}"; do
+    pid=${leader[$tty]}
+    # a privileged process (e.g. one with file capabilities) hides its cwd;
+    # fall back to the shell that owns the session
+    cwd=$(readlink "/proc/${fg[$tty]:-$pid}/cwd" 2>/dev/null \
+       || readlink "/proc/$pid/cwd" 2>/dev/null || echo '?')
+    cmd=${fgcmd[$tty]:-'(idle)'}
+    case "$cmd" in abduco\ *) continue ;; esac    # a window attached to a session
+    # idle: nothing in the foreground, the session is named after its shell
+    if [ -n "${fg[$tty]:-}" ]; then
+      name=$(proc_name "${fg[$tty]}" "$cmd"); shown=$name
+    else
+      name=$(proc_name "$pid" ""); shown='(idle)'
+    fi
+    dir=$(pretty_path "$cwd")
+    [ ${#dir} -gt 30 ] && dir="…${dir: -29}"   # keep the columns aligned
+    printf '%s\t%s\t  %-16s %-30s %-12s %s\t%s\t%s\t\n' \
+      "$pid" "$tty" "$shown" "$dir" "$tty" "${age[$tty]}" "$cmd" "$name"
+  done
+}
+
+# ---------------------------------------------------------------- processes --
+list_processes() {
+  while read -r pid tty etime cmd; do
+    [ "$tty" = "?" ] && continue
+    [ -n "${captured[$tty]:-}" ] && continue
+    case "$cmd" in abduco\ *|reptyr\ *) continue ;; esac   # session clients / stealers
+    [ "$tty" = "$self_tty" ] && continue
+    name=$(proc_name "$pid" "$cmd")
+    printf '%s\t%s\t  %-16s %-12s %-9s %s\t%s\t%s\t\n' \
+      "$pid" "$tty" "$name" "$tty" "$etime" "$pid" "$cmd" "$name"
+  done < <(ps -u "$USER" -o pid=,tty=,etime=,args= --sort=-start_time)
+}
+
+# ----------------------------------------------------------------- sessions --
+# one row per abduco session, marked '*', shaped like the rows above, with the
+# session name in the TTY column and in a sixth field that picking it acts on
+list_sessions() {
+  local state sname target tty tpgid age fgp cmd cwd dir name shown where
+  while IFS=$'\t' read -r state sname; do
+    [ -n "$sname" ] || continue
+    target=$(session_target "$sname" || true)
+    tty="" fgp="" cmd="" cwd="?" age=""
+    if [ -n "$target" ] && read -r tty tpgid age < <(ps -o tty=,tpgid=,etime= -p "$target"); then
+      # the program in the foreground of the stolen terminal, not its shell
+      fgp=$target
+      [ "${tpgid:-0}" -gt 0 ] && [ -d "/proc/$tpgid" ] && fgp=$tpgid
+      cmd=$(ps -o args= -p "$fgp" || true)
+      cwd=$(readlink "/proc/$fgp/cwd" 2>/dev/null || readlink "/proc/$target/cwd" 2>/dev/null || echo '?')
+      name=$(proc_name "$fgp" "$cmd")
+      shown=$name
+    else
+      name=$sname shown=$sname
+    fi
+    case "$state" in
+      '*') where='attached in another window' ;;
+      '+') where='program exited' ;;
+      *)   where='detached' ;;
+    esac
+    dir=$(pretty_path "$cwd")
+    [ ${#dir} -gt 30 ] && dir="…${dir: -29}"
+    if [ "$mode" = terminal ]; then
+      printf '%s\t%s\t* %-16s %-30s %-12s %s\t%s\t%s\t%s\n' \
+        "$target" "$tty" "$shown" "$dir" "$sname" "$age" "session $sname, $where: $cmd" "$name" "$sname"
+    else
+      printf '%s\t%s\t* %-16s %-12s %-9s %s\t%s\t%s\t%s\n' \
+        "$target" "$tty" "$name" "$sname" "$age" "$fgp" "session $sname, $where: $cmd" "$name" "$sname"
+    fi
+  done < <({ abduco 2>/dev/null || true; } | awk -F'\t' 'NR > 1 {print substr($1, 1, 1) "\t" $NF}')
+}
+
+# a free session name: the process name plus the first unused number,
+# vim -> vim0, vim1, ...
+free_session_name() {
+  local base n=0
+  base=$(tr -c 'A-Za-z0-9_.\n-' '_' <<<"$1")
+  base=${base#-}
+  case "$base" in *[0-9]) base+=- ;; esac     # python3 -> python3-0, not python30
+  while session_exists "$base$n"; do n=$((n + 1)); done
+  printf '%s' "$base$n"
+}
+
+# originals plus sessions, the sessions next to originals of the same name
+build_rows() {
+  { if [ "$mode" = terminal ]; then list_terminals; else list_processes; fi
+    list_sessions
+  } | grep -v '^$' | sort -t$'\t' -k5,5 -k3,3 || true
+}
+
+if [ "$rows_only" -eq 1 ]; then build_rows; exit 0; fi
+
+if [ "$mode" = terminal ]; then
+  header='  PROCESS          DIRECTORY                      TTY          UPTIME'
+  prompt='terminal> '
+else
+  header='  PROCESS          TTY          UPTIME    PID'
+  prompt='process> '
+fi
+rows=$(build_rows)
+legend=""
+[ -n "$(session_names)" ] && \
+  legend='* captured: detached, or attached in another window · enter joins · ctrl-x kills'
+
+# Ctrl-X kills the session on the current row (a no-op elsewhere), then reloads
+self=$(printf '%q' "$(readlink -f "$0")")
+[ "$mode" = process ] && self_rows="$self -p --rows" || self_rows="$self --rows"
+
+[ -n "$rows" ] || die "nothing to attach to (other than this terminal)"
+
+if [ "$list_only" -eq 1 ]; then
+  printf '%s\n%s\n' "$header" "$(cut -f3 <<<"$rows")"
+  [ -n "$legend" ] && printf '\n%s\n' "$legend"
+  exit 0
+fi
+
+# the legend goes in the footer; fzf older than 0.63 has none, so it joins the header
+legend_opt=()
+if [ -n "$legend" ]; then
+  if fzf --help 2>/dev/null | grep -q -- '--footer='; then
+    legend_opt=(--footer="$legend")
+  else
+    header+=$'\n'"$legend"
+  fi
+fi
+
+sel=$(printf '%s\n' "$rows" | fzf \
+  --delimiter='\t' --with-nth=3 \
+  --header="$header" --header-lines=0 --prompt="$prompt" \
+  "${legend_opt[@]}" \
+  --bind="ctrl-x:execute-silent($self --kill {6})+reload($self_rows)" \
+  --height=60% --reverse --exit-0 \
+  --preview='printf "%s\n\n" {4}; ps -t {2} -o pid,stat,etime,args --forest' \
+  --preview-window=down,40%,wrap) || exit 130
+
+[ -n "$sel" ] || exit 0
+pid=$(cut -f1 <<<"$sel")
+tty=$(cut -f2 <<<"$sel")
+name=$(cut -f5 <<<"$sel")
+picked_session=$(cut -f6 <<<"$sel")
+[ -n "$picked_session" ] && resume "$picked_session"
+
+# reptyr runs as us, not under sudo: as root it creates the new pty owned by
+# root and the stolen process can't open it. It needs ptrace rights instead.
+if [ "$(id -u)" -ne 0 ] && [ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" != 0 ] \
+   && ! getcap "$(command -v reptyr)" 2>/dev/null | grep -q cap_sys_ptrace; then
+  die "reptyr can't ptrace other processes (yama ptrace_scope is $(cat /proc/sys/kernel/yama/ptrace_scope)); see https://github.com/jaderfeijo/attach#ptrace-permission"
+fi
+
+# kill the stolen terminal's emulator once reptyr has taken over its end of
+# the pty (it drops the tty-index from its fdinfo), which closes the frozen
+# window; gives up after 20s, e.g. when reptyr failed and it still owns it
+close_old_window() {  # pid tty-index comm
+  local i
+  for i in $(seq 100); do
+    sleep 0.2
+    [ "$(cat "/proc/$1/comm" 2>/dev/null)" = "$3" ] || return 0     # gone already
+    grep -hs '^tty-index:' "/proc/$1/fdinfo/"* | awk '{print $2}' | grep -qxF "$2" \
+      || { kill -KILL "$1" 2>/dev/null; return 0; }
+  done
+}
+export -f close_old_window
+
+emu_pid="" emu_idx="" emu_comm=""
+if [ "$mode" = terminal ]; then
+  echo "attach: stealing $tty (pid $pid)"
+  set -- -T "$pid"
+  if [ "$keep_window" -eq 0 ]; then
+    # the process holding the pty's master side: the emulator, sshd, ... —
+    # only closed when this is the one terminal it hosts
+    emu=$(ps -o ppid= -p "$pid" | tr -d ' ')
+    masters=$(grep -hs '^tty-index:' "/proc/$emu/fdinfo/"* | awk '{print $2}' | sort -u || true)
+    if [ "$masters" = "${tty#pts/}" ]; then
+      emu_pid=$emu emu_idx=${tty#pts/} emu_comm=$(cat "/proc/$emu/comm")
+      echo "attach: the original window ($emu_comm, pid $emu_pid) will close"
+    elif [ -n "$masters" ]; then
+      echo "attach: $(cat "/proc/$emu/comm") also hosts other terminals, leaving its window open (frozen)"
+    fi
+  fi
+else
+  echo "attach: reparenting pid $pid"
+  set -- "$pid"
+fi
+
+if [ "$use_session" -eq 0 ]; then
+  [ -n "$emu_pid" ] && close_old_window "$emu_pid" "$emu_idx" "$emu_comm" </dev/null >/dev/null 2>&1 &
+  repaint_later "$pid" 1.5 </dev/null >/dev/null 2>&1 &
+  exec reptyr "$@"
+fi
+
+if [ -z "$session" ]; then
+  session=$(free_session_name "$name")
+elif session_exists "$session"; then
+  die "session '$session' already exists (pick another name with -s)"
+fi
+
+echo "attach: in session '$session' — detach with Ctrl-D, return with 'attach -r $session'"
+
+# ATTACH_SESSION stops a nested `attach` from wrapping again; hold the session
+# open when reptyr stops early, or the error vanishes with it
+exec abduco -e "$DETACH_KEY" -c "$session" env ATTACH_SESSION="$session" \
+  EMU_PID="$emu_pid" EMU_IDX="$emu_idx" EMU_COMM="$emu_comm" TARGET="$pid" bash -c '
+  [ -n "$EMU_PID" ] && close_old_window "$EMU_PID" "$EMU_IDX" "$EMU_COMM" </dev/null >/dev/null 2>&1 &
+  repaint_later "$TARGET" 1.5 </dev/null >/dev/null 2>&1 &
+  reptyr "$@" || {
+    printf "\nattach: reptyr exited (status %s) — press enter to close\n" "$?"
+    read -r _
+  }' attach "$@"
