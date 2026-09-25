@@ -68,7 +68,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
-[ "$(uname -s)" = Linux ] || die "attach is Linux only (it relies on /proc and ptrace)"
+[ "$(uname -s)" = Linux ] || die "attach is Linux only; see https://github.com/$REPO/blob/main/docs/macos.md"
 
 # -------------------------------------------------------------- dependencies --
 pm=""

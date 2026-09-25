@@ -31,7 +31,24 @@ It combines three tools:
   once.
 - [fzf](https://github.com/junegunn/fzf) provides the picker.
 
+> **Linux only.** macOS is not supported and won't be: it doesn't let one
+> process take over another like this. [docs/macos.md](docs/macos.md) explains
+> why, and what to use on a Mac instead.
+
 ## Install
+
+### Arch Linux (AUR)
+
+```sh
+yay -S attach        # or paru -S attach, or any AUR helper
+```
+
+The package installs `attach` to `/usr/bin` and pulls in reptyr, abduco and
+fzf. It doesn't change any system setting. After installing, it tells you how
+to set up [ptrace permission](#ptrace-permission), and it ships both
+options as opt-in files in `/usr/share/attach/`.
+
+### Any distro (install script)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jaderfeijo/attach/main/install.sh | bash
@@ -65,7 +82,8 @@ three dependencies, then set up [ptrace permission](#ptrace-permission) yourself
 
 ### Requirements
 
-- Linux (attach reads `/proc` and uses ptrace)
+- Linux (attach reads `/proc` and uses ptrace). macOS is
+  [not supported](docs/macos.md).
 - bash 4.4+, procps (`ps`, `pgrep`), coreutils
 - reptyr, abduco, fzf (0.63+ shows the legend as a footer; older versions show
   it in the header)
@@ -157,6 +175,15 @@ sudo sysctl --system
 sudo setcap cap_sys_ptrace+ep "$(command -v reptyr)"
 ```
 
+These files are in [`contrib/`](contrib), and the AUR package installs them to
+`/usr/share/attach/`:
+
+- [`60-attach-ptrace.conf`](contrib/60-attach-ptrace.conf): the `scope` option;
+  copy it to `/etc/sysctl.d/`.
+- [`attach-reptyr-ptrace.hook`](contrib/attach-reptyr-ptrace.hook): with the
+  `cap` option, re-applies the capability after reptyr upgrades; copy it to
+  `/etc/pacman.d/hooks/`.
+
 ## Limitations
 
 - **Ctrl-D belongs to the session.** Inside a session it detaches instead of
@@ -171,6 +198,11 @@ sudo setcap cap_sys_ptrace+ep "$(command -v reptyr)"
 - **Linux only.** Sessions and captures are found through `/proc`.
 
 ## Uninstall
+
+Installed from the AUR: `sudo pacman -R attach`. Any of the opt-in files you
+copied into `/etc` stay there until you remove them.
+
+Installed with the script:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jaderfeijo/attach/main/install.sh | bash -s -- --uninstall

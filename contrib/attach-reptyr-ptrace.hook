@@ -1,0 +1,13 @@
+# Opt-in for attach, for those who chose `setcap cap_sys_ptrace+ep` on reptyr:
+# pacman drops file capabilities on upgrade, so this puts it back. Copy to
+# /etc/pacman.d/hooks/. See README.md#ptrace-permission for the trade-offs.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = reptyr
+
+[Action]
+Description = Granting cap_sys_ptrace to reptyr (attach)...
+When = PostTransaction
+Exec = /usr/bin/setcap cap_sys_ptrace+ep /usr/bin/reptyr

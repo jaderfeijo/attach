@@ -36,6 +36,8 @@ ATTACH_VERSION=0.1.0
 
 die() { printf 'attach: %s\n' "$*" >&2; exit 1; }
 
+[ "$(uname -s)" = Linux ] || die "Linux only; see https://github.com/jaderfeijo/attach/blob/main/docs/macos.md"
+
 usage() {
   awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
   exit 0
