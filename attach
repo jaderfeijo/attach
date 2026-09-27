@@ -259,7 +259,10 @@ list_terminals() {
     [ -n "${captured[$tty]:-}" ] && continue       # already stolen / inside a session
     [ "$tty" = "$self_tty" ] && continue           # never offer our own terminal
     [ "$pid" = "$sid" ] && { leader[$tty]=$pid; age[$tty]=$etime; }
-    if [ "$pgid" = "$tpgid" ]; then                # foreground process group
+    # foreground process group: name it after the group leader if it's alive,
+    # not whatever it left behind (e.g. clipboard helpers like wl-copy that
+    # fork into the background but stay in the group, and on the tty)
+    if [ "$pgid" = "$tpgid" ] && [ "${fg[$tty]:-}" != "$tpgid" ]; then
       fg[$tty]=$pid
       fgcmd[$tty]=$cmd
     fi
